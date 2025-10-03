@@ -5,6 +5,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 import os
 import sys
 import traceback
+import gc # --- [追加] --- ガベージコレクションを明示的に呼び出すためにインポート
 
 import message_filters
 from sensor_msgs.msg import Image
@@ -63,12 +64,12 @@ class DepthEnhancerNode(Node):
                 'CAM_BACK', 'CAM_BACK_LEFT', 'CAM_BACK_RIGHT'
             ]
 
-            qos_profile = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST, depth=5)
+            qos_profile = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST, depth=1)
 
             for cam in self.cameras:
                 cam_lower = cam.lower()
                 pub_topic = f'/nuscenes/{cam_lower}/dense_depth'
-                self.depth_publishers[cam] = self.create_publisher(Image, pub_topic, 10)
+                self.depth_publishers[cam] = self.create_publisher(Image, pub_topic, qos_profile)
                 image_sub_topic = f'/nuscenes/{cam_lower}/image_raw'
                 sparse_depth_sub_topic = f'/nuscenes/{cam_lower}/depth'
                 image_sub = message_filters.Subscriber(self, Image, image_sub_topic, qos_profile=qos_profile)
@@ -96,6 +97,9 @@ class DepthEnhancerNode(Node):
 
         with torch.no_grad():
             dense_relative_depth = self.model.infer_image(bgr_image)
+            # --- [追加] --- GPUメモリキャッシュを解放
+            if self.device.type == 'cuda':
+                torch.cuda.empty_cache()
 
         valid_mask = sparse_depth > 0.01
         lidar_values = sparse_depth[valid_mask]
@@ -117,6 +121,19 @@ class DepthEnhancerNode(Node):
             self.depth_publishers[cam_name].publish(final_depth_msg)
         except Exception as e:
             self.get_logger().error(f"Failed to publish dense depth for {cam_name}: {e}")
+        finally:
+            # --- [追加] --- メモリリーク対策として、使用済みの大きなオブジェクトを明示的に削除
+            del bgr_image
+            del sparse_depth
+            del dense_relative_depth
+            del valid_mask
+            del lidar_values
+            del model_values
+            del dense_aligned_depth
+            if 'final_depth_msg' in locals():
+                del final_depth_msg
+            # --- [追加] --- ガベージコレクションを強制的に実行
+            gc.collect()
 
 def main(args=None):
     rclpy.init(args=args)
