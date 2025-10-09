@@ -36,14 +36,14 @@ def generate_launch_description():
 
     rate_arg = DeclareLaunchArgument(
         'publish_rate_hz',
-        default_value='1.0',
-        description='Publishing rate in Hz.'
+        default_value='0.5', #dense depth modelの処理速度に合わせる
+        description='Publishing rate in Hz. Only float values are supported.'
     )
 
     # --- depth_enhancer の起動引数 (必須) ---
     checkpoint_path_arg = DeclareLaunchArgument(
         'checkpoint_path',
-        default_value='/root/weights/perception/nuscenes_pkgs/Depth-Anything-V2-Small/depth_anything_v2_vits.pth',
+        default_value='/root/weights/nuscenes_pkgs/Depth-Anything-V2-Small/depth_anything_v2_vits.pth',
         description='Path to the local directory with the Depth Anything V2 model. THIS IS MANDATORY.'
     )
 

@@ -13,8 +13,13 @@ import gc # Import garbage collector interface
 # ROS 2 メッセージ
 from sensor_msgs.msg import Image, CameraInfo, PointCloud2
 from nav_msgs.msg import Odometry
-from geometry_msgs.msg import Pose, Point, Quaternion as QuaternionMsg, Twist, Vector3
+from geometry_msgs.msg import Pose, Point, Quaternion as QuaternionMsg, Twist, Vector3, TransformStamped
 from std_msgs.msg import Header
+from tf2_msgs.msg import TFMessage
+
+# TF2
+import tf2_ros
+from tf2_geometry_msgs import do_transform_point # tf2_geometry_msgsのインポートは必要ないが、tf2の依存関係を示す
 
 # NuScenes
 from nuscenes.nuscenes import NuScenes
@@ -27,7 +32,9 @@ class NuScenesRos2Streamer(Node):
     """
 
     def __init__(self):
+
         super().__init__('nuscenes_streamer')
+        self.get_logger().propagate = False # 親ロガーへのログの伝播を無効。(重複したコメント出力を無効化)
 
         # パラメータ宣言
         self.declare_parameter('dataroot', '/path/to/your/nuscenes/data')
@@ -61,23 +68,49 @@ class NuScenesRos2Streamer(Node):
         self.cv_bridge = CvBridge()
         self.image_publishers = {}
         self.depth_publishers = {}
+        self.camera_info_publishers = {}
+
+        qos_profile = rclpy.qos.QoSProfile(
+            reliability=rclpy.qos.ReliabilityPolicy.BEST_EFFORT,
+            history=rclpy.qos.HistoryPolicy.KEEP_LAST,
+            depth=1
+        )
+
         for cam in self.cameras:
+            # カメラ情報用
+            info_topic_name = f'/nuscenes/{cam.lower()}/camera_info'
+            self.camera_info_publishers[cam] = self.create_publisher(CameraInfo, info_topic_name, qos_profile)
+            self.get_logger().info(f"Publishing {cam} camera info to {info_topic_name}")
+
             # カラー画像用
             topic_name = f'/nuscenes/{cam.lower()}/image_raw'
-            self.image_publishers[cam] = self.create_publisher(Image, topic_name, 10)
+            self.image_publishers[cam] = self.create_publisher(Image, topic_name, qos_profile)
             self.get_logger().info(f"Publishing {cam} images to {topic_name}")
 
             # 深度画像用
             depth_topic_name = f'/nuscenes/{cam.lower()}/depth'
-            self.depth_publishers[cam] = self.create_publisher(Image, depth_topic_name, 10)
+            self.depth_publishers[cam] = self.create_publisher(Image, depth_topic_name, qos_profile)
             self.get_logger().info(f"Publishing {cam} depth to {depth_topic_name}")
 
-
         # オドメトリ用Publisher
-        self.odom_publisher = self.create_publisher(Odometry, '/nuscenes/odom', 10)
-        self.get_logger().info("Publishing odometry to /nuscenes/odom")
+        self.odom_publisher = self.create_publisher(Odometry, '/nuscenes/odometry', qos_profile)
+        self.get_logger().info("Publishing odometry to /nuscenes/odometry")
+
+        # StaticTF用Publisher
+        self.static_tf_pub = self.create_publisher(
+            TFMessage,
+            '/tf_static',
+            qos_profile=rclpy.qos.QoSProfile(
+                reliability=rclpy.qos.ReliabilityPolicy.RELIABLE,
+                history=rclpy.qos.HistoryPolicy.KEEP_LAST,
+                depth=1,
+                durability=rclpy.qos.DurabilityPolicy.TRANSIENT_LOCAL # Static TFの永続性を確保
+            )
+        )
+        self.get_logger().info("Publishing static transforms to /tf_static with Transient Local QoS.")
 
         # 再生するシーンのリストを取得
+        self._is_finished = False
         self.scenes_to_play = []
         if self.play_all_scenes:
             self.scenes_to_play = self.nusc.scene
@@ -100,6 +133,9 @@ class NuScenesRos2Streamer(Node):
         self.current_scene = self.scenes_to_play[self.current_scene_index]
         self.current_sample_token = self.current_scene['first_sample_token']
         self.get_logger().info(f"Starting with scene '{self.current_scene['name']}' ({self.current_scene_index + 1}/{len(self.scenes_to_play)}).")
+
+        # キャリブレーションデータを取得し、Static TFを一度だけパブリッシュ
+        self.publish_static_transforms()
 
         # メインループのタイマーを作成
         self.timer = self.create_timer(1.0 / self.publish_rate, self.stream_data)
@@ -129,12 +165,82 @@ class NuScenesRos2Streamer(Node):
             self.current_sample_token = ''  # ループを終了させる
             self.timer.cancel()
 
+    def is_finished(self) -> bool:
+        """
+        ノードの処理が完了したかどうかを返します。
+        mainループはこのメソッドの返り値を見て終了を判断します。
+        @return: 処理が完了していればTrue、そうでなければFalse
+        """
+        return self._is_finished
+
+    def publish_static_transforms(self):
+        """
+        base_linkに対するセンサー（カメラ、LiDAR）の静的変換を一度だけパブリッシュする。
+        TFMessageにまとめて送信することで、Transient Localキャッシュにすべての変換を残す。
+        """
+        self.get_logger().info("Publishing static sensor transforms...")
+
+        # NuScenesのすべての calibrated_sensor 情報を取得
+        sensor_tokens = self.nusc.sensor
+
+        transforms_to_publish = []
+
+        # センサー名とフレームIDのマッピングを作成
+        sensors_to_check = self.cameras + [self.lidar_sensor]
+
+        for sensor_record in self.nusc.calibrated_sensor:
+            sensor_token = sensor_record['token']
+
+            # 対応するセンサーレコードを検索
+            sensor_type = None
+            for sensor in sensor_tokens:
+                if sensor['token'] == sensor_record['sensor_token']:
+                    sensor_type = sensor['channel']
+                    break
+
+            if sensor_type in sensors_to_check:
+                # フレームIDを小文字に変換
+                child_frame_id = sensor_type.lower()
+
+                # 変換情報を取得
+                translation = sensor_record['translation']
+                rotation = sensor_record['rotation'] # [w, x, y, z]
+
+                t = TransformStamped()
+                # Static TFなので、ヘッダのタイムスタンプは現在時刻で良い
+                t.header.stamp = self.get_clock().now().to_msg()
+                t.header.frame_id = 'base_link'
+                t.child_frame_id = child_frame_id
+
+                # Translation
+                t.transform.translation.x = translation[0]
+                t.transform.translation.y = translation[1]
+                t.transform.translation.z = translation[2]
+
+                # Rotation (Quaternions from NuScenes are [w, x, y, z])
+                t.transform.rotation.x = rotation[1]
+                t.transform.rotation.y = rotation[2]
+                t.transform.rotation.z = rotation[3]
+                t.transform.rotation.w = rotation[0]
+
+                transforms_to_publish.append(t)
+
+        # Static TFをTFMessageにまとめて一度だけパブリッシュ
+        if transforms_to_publish:
+            tf_msg = TFMessage()
+            tf_msg.transforms = transforms_to_publish
+            self.static_tf_pub.publish(tf_msg)
+
+        self.get_logger().info("Finished publishing static sensor transforms as a single TFMessage.")
+
     def stream_data(self):
         """
         メインのデータストリーミング関数
         """
+
         if not self.current_sample_token:
             # これ以上再生するサンプルがない場合（全てのシーンが終了した）
+            self._is_finished = True
             return
 
         sample = self.nusc.get('sample', self.current_sample_token)
@@ -145,7 +251,7 @@ class NuScenesRos2Streamer(Node):
         self.publish_odometry(sample, ros_timestamp)
         self.publish_images(sample, ros_timestamp)
         self.publish_depth_images(sample, ros_timestamp)
-
+        self.publish_camera_info(sample, ros_timestamp)
 
         # 次のサンプルへ
         next_token = sample['next']
@@ -160,6 +266,58 @@ class NuScenesRos2Streamer(Node):
         gc.collect()
         # === MEMORY LEAK FIX END ===
 
+    def _get_camera_intrinsic_matrix(self, cam_intrinsic):
+        """
+        NuScenesのカメラ内部行列(3x3リスト)をCameraInfoのKフィールド(9要素リスト)に変換するヘルパー関数
+        """
+        # NuScenesの内部行列は [[fx, 0, cx], [0, fy, cy], [0, 0, 1]] 形式
+        K = [0.0] * 9
+        K[0] = cam_intrinsic[0][0] # fx
+        K[2] = cam_intrinsic[0][2] # cx
+        K[4] = cam_intrinsic[1][1] # fy
+        K[5] = cam_intrinsic[1][2] # cy
+        K[8] = 1.0                # 常に1.0
+        return K
+
+    def publish_camera_info(self, sample, timestamp):
+        """
+        各カメラのキャリブレーション情報をパブリッシュする
+        """
+        for cam in self.cameras:
+            # カメラデータとキャリブレーションセンサーレコードを取得
+            cam_data = self.nusc.get('sample_data', sample['data'][cam])
+            cam_cs_record = self.nusc.get('calibrated_sensor', cam_data['calibrated_sensor_token'])
+
+            info_msg = CameraInfo()
+            info_msg.header.stamp = timestamp
+            info_msg.header.frame_id = cam.lower()
+
+            # 1. 画像サイズ
+            info_msg.width = cam_data['width']
+            info_msg.height = cam_data['height']
+
+            # 2. 内部パラメータ K (3x3行列)
+            K_list = self._get_camera_intrinsic_matrix(cam_cs_record['camera_intrinsic'])
+            info_msg.k = K_list
+
+            # 3. 歪み係数 D とモデル
+            # NuScenesでは歪み補正済みと見なし、歪みなし (0埋め) とするのが一般的
+            info_msg.distortion_model = "plumb_bob"
+            info_msg.d = [0.0] * 5
+
+            # 4. 回転行列 R (3x3行列) - 単眼カメラ設定のため、単位行列
+            info_msg.r = [1.0, 0.0, 0.0,
+                          0.0, 1.0, 0.0,
+                          0.0, 0.0, 1.0]
+
+            # 5. 投影行列 P (3x4行列) - 単眼カメラ設定のため、Kを拡張 ([K|0]の形式)
+            P_list = K_list[:3] + [0.0] + K_list[3:6] + [0.0] + K_list[6:] + [0.0]
+            info_msg.p = P_list
+
+            self.camera_info_publishers[cam].publish(info_msg)
+
+            # メモリリーク対策
+            del info_msg
 
     def publish_odometry(self, sample, timestamp):
         """
@@ -174,8 +332,8 @@ class NuScenesRos2Streamer(Node):
         odom_msg.child_frame_id = "base_link"
 
         # Pose
-        translation = ego_pose['translation']
-        rotation_q = ego_pose['rotation']
+        translation = ego_pose['translation'] # [x, y, z]
+        rotation_q = ego_pose['rotation'] # [w, x, y, z]
         odom_msg.pose.pose.position = Point(x=translation[0], y=translation[1], z=translation[2])
         odom_msg.pose.pose.orientation = QuaternionMsg(x=rotation_q[1], y=rotation_q[2], z=rotation_q[3], w=rotation_q[0])
 
@@ -283,11 +441,22 @@ class NuScenesRos2Streamer(Node):
 
 
 def main(args=None):
+    """
+    ノードを初期化し、データストリームが完了するまで実行。
+    完了後、自動的にシャットダウン。
+    """
     rclpy.init(args=args)
     node = NuScenesRos2Streamer()
+
     try:
-        rclpy.spin(node)
+        # ノードが完了するまでループ node.is_finished()がTrueを返すのを待つ
+        while rclpy.ok() and not node.is_finished():
+            rclpy.spin_once(node, timeout_sec=None)
+        time.sleep(1)
+        node.get_logger().info('Shutting down the node after completion.')
     except KeyboardInterrupt:
+        # ユーザーがCtrl+Cで中断した場合
+        node.get_logger().info('Keyboard interrupt detected, shutting down.')
         pass
     finally:
         node.destroy_node()

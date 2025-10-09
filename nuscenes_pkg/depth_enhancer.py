@@ -64,7 +64,11 @@ class DepthEnhancerNode(Node):
                 'CAM_BACK', 'CAM_BACK_LEFT', 'CAM_BACK_RIGHT'
             ]
 
-            qos_profile = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST, depth=1)
+            qos_profile = QoSProfile(
+                reliability=ReliabilityPolicy.BEST_EFFORT,
+                history=HistoryPolicy.KEEP_LAST,
+                depth=5
+            )
 
             for cam in self.cameras:
                 cam_lower = cam.lower()
